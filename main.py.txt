@@ -1,0 +1,178 @@
+import os
+import time
+import threading
+import requests
+import telebot
+from telebot import types
+from flask import Flask
+
+# --- ВЕБ-СЕРВЕР ДЛЯ БЕСПЛАТНОГО ТАРИФА RENDER ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running 24/7!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+
+# --- НАСТРОЙКИ БОТА ---
+TOKEN = os.getenv('BOT_TOKEN', '8865583893:AAHPCDTPecaRxmfUY-niq7UCMdn0t5SoJk8')
+CHAT_ID = os.getenv('CHAT_ID', '8889922027')
+
+TARGET_MAX_PRICE = 85.0       # Курс меньше 85.0 RUB
+MIN_LIMIT_LOW = 500.0         # Левый лимит от 500
+MIN_LIMIT_HIGH = 2000.0       # Левый лимит до 2000
+MAX_LIMIT_LOW = 500.0         # Правый лимит от 500
+MAX_LIMIT_HIGH = 2000.0       # Правый лимит до 2000
+
+bot = telebot.TeleBot(TOKEN)
+is_running = False
+notified_orders = {}
+
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(max_retries=3)
+session.mount('https://', adapter)
+def fetch_htx_p2p():
+    all_orders = []
+    seen_ids = set()
+    
+    url = "https://www.htx.com/-/x/otc/v1/data/trade-market"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.htx.com/ru-ru/fiat-crypto/trader/",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache"
+    }
+
+    for page in range(1, 4):
+        params = {
+            "coinId": 2,          # USDT
+            "currency": 11,       # RUB
+            "tradeType": "sell",  # Покупка USDT
+            "currPage": page,
+            "payMethod": 0,
+            "acceptOrder": 0,
+            "country": 0,
+            "blockType": "general",
+            "online": 1,
+            "range": 0,
+            "amount": "",
+            "merchantCheck": 0
+        }
+        try:
+            response = session.get(url, params=params, headers=headers, timeout=5)
+            if response.status_code == 200:
+                res_data = response.json()
+                data = res_data.get("data", [])
+                if isinstance(data, list):
+                    for item in data:
+                        item_id = str(item.get("id"))
+                        
+                        has_limit = item.get("isLimitRequire") or item.get("limitRequire")
+                        req_text = item.get("gatingRequirement") or item.get("limitRequirement") or ""
+                        
+                        if has_limit and req_text:
+                            continue
+
+                        if item_id not in seen_ids:
+                            seen_ids.add(item_id)
+                            all_orders.append(item)
+        except Exception as e:
+            print(f"Ошибка запроса страницы {page}: {e}")
+            
+    return all_orders
+def get_main_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    btn_start = types.KeyboardButton("▶️ Запустить поиск")
+    btn_stop = types.KeyboardButton("⏹ Остановить поиск")
+    btn_status = types.KeyboardButton("📊 Статус")
+    markup.add(btn_start, btn_stop)
+    markup.add(btn_status)
+    return markup
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.send_message(
+        message.chat.id, 
+        "🤖 Бот HTX P2P запущен на Render (Free Web Service)!\nУправляй кнопками ниже:", 
+        reply_markup=get_main_keyboard()
+    )
+
+@bot.message_handler(func=lambda message: True)
+def handle_buttons(message):
+    global is_running
+    
+    if message.text == "▶️ Запустить поиск":
+        if not is_running:
+            is_running = True
+            bot.send_message(message.chat.id, "🚀 Поиск запущен! Мониторю стакан...")
+            threading.Thread(target=monitoring_loop, daemon=True).start()
+        else:
+            bot.send_message(message.chat.id, "⚠️ Поиск уже работает!")
+            
+    elif message.text == "⏹ Остановить поиск":
+        if is_running:
+            is_running = False
+            bot.send_message(message.chat.id, "🛑 Поиск остановлен.")
+        else:
+            bot.send_message(message.chat.id, "⚠️ Поиск выключен.")
+            
+    elif message.text == "📊 Статус":
+        status_str = "🟢 РАБОТАЕТ" if is_running else "🔴 ОСТАНОВЛЕН"
+        bot.send_message(
+            message.chat.id, 
+            f"Статус: {status_str}\nКурс: < {TARGET_MAX_PRICE} RUB\nЛимиты: {int(MIN_LIMIT_LOW)}-{int(MIN_LIMIT_HIGH)} RUB"
+        )
+def monitoring_loop():
+    global is_running
+    while is_running:
+        try:
+            orders = fetch_htx_p2p()
+            for item in orders:
+                if not is_running:
+                    break
+                
+                order_id = str(item.get("id"))
+                price = float(item.get("price", 9999))
+                min_limit = float(item.get("minTradeLimit", 0))
+                max_limit = float(item.get("maxTradeLimit", 0))
+                merchant = item.get("userName", "Неизвестный")
+                
+                pay_methods_data = item.get("payMethods", [])
+                pay_names = [pm.get("name", "") for pm in pay_methods_data if pm.get("name")]
+                banks_str = ", ".join(pay_names) if pay_names else "Не указано"
+                
+                check_price = price < TARGET_MAX_PRICE
+                check_min = MIN_LIMIT_LOW <= min_limit <= MIN_LIMIT_HIGH
+                check_max = MAX_LIMIT_LOW <= max_limit <= MAX_LIMIT_HIGH
+
+                if check_price and check_min and check_max:
+                    if order_id not in notified_orders or price < notified_orders[order_id]:
+                        notified_orders[order_id] = price
+                        
+                        alert_text = (
+                            f"🎯 **НАЙДЕН ОРДЕР!**\n\n"
+                            f"💵 **Курс:** {price} RUB\n"
+                            f"👤 **Продавец:** {merchant}\n"
+                            f"📊 **Лимиты:** {int(min_limit):,} - {int(max_limit):,} RUB\n"
+                            f"🏦 **Банки:** {banks_str}\n\n"
+                            f"🔗 [Забрать на HTX](https://www.htx.com/ru-ru/fiat-crypto/trader/)"
+                        )
+                        bot.send_message(CHAT_ID, alert_text, parse_mode="Markdown")
+                        print(f"[{time.strftime('%H:%M:%S')}] АЛЕРТ: {price} RUB | {merchant}")
+
+        except Exception as e:
+            print(f"Ошибка цикла: {e}")
+            
+        time.sleep(2)
+
+if __name__ == '__main__':
+    # Запускаем веб-сервер в отдельном потоке
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    print("Бот запущен и ожидает команд...")
+    bot.polling(non_stop=True)
